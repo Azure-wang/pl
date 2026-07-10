@@ -67,6 +67,7 @@ private:
   std::string newLabel(const std::string& prefix);
 
   void genExpr(Expr& expr);
+  void genExprInto(Expr& expr, const std::string& rd);
   // Constant folding helpers (used with -opt)
   bool isConstExpr(Expr& expr);
   int32_t evalConstExpr(Expr& expr);

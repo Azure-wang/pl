@@ -116,6 +116,11 @@ bool SemanticAnalyzer::checkStmtsReturn(const std::vector<std::unique_ptr<Stmt>>
             checkSingleReturn(ifst->elseBody.get())) return true;
       }
     }
+    if (auto* wh = dynamic_cast<WhileStmt*>(stmt.get())) {
+      if (auto* n = dynamic_cast<NumberExpr*>(wh->condition.get())) {
+        if (n->value != 0 && checkSingleReturn(wh->body.get())) return true;
+      }
+    }
   }
   return false;
 }

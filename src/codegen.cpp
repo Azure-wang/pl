@@ -2,6 +2,12 @@
 
 namespace toyc {
 
+// Forward declarations for static helpers
+static bool isPowerOf2(int32_t n);
+static int ilog2(int32_t n);
+static bool isSimpleExpr(Expr& expr);
+static bool containsCall(Expr& expr);
+
 CodeGenerator::CodeGenerator(std::shared_ptr<ErrorReporter> reporter, bool optimize)
     : reporter_(reporter), optimize_(optimize) {}
 
@@ -103,6 +109,17 @@ void CodeGenerator::visit(FuncDef& node) {
   int totalFrame = fi_.frameSize + spillsArea + argsArea;
   totalFrame = (totalFrame + 15) & ~15;
 
+  // Peephole: remove dead "mv t0, a0" before unconditional jumps
+  std::string bodyStr = body.str();
+  if (optimize_) {
+    std::string pat = "  mv t0, a0\n  j ";
+    size_t pos = 0;
+    while ((pos = bodyStr.find(pat, pos)) != std::string::npos) {
+      bodyStr.replace(pos, pat.length(), "  j ");
+      pos += 4;
+    }
+  }
+
   // Output function
   if (node.name == "main") {
     out_ << "\n  .globl main\n";
@@ -115,7 +132,7 @@ void CodeGenerator::visit(FuncDef& node) {
   if (fi_.hasCalls) {
     out_ << "  sw ra, 0(sp)\n";
   }
-  out_ << body.str();
+  out_ << bodyStr;
   out_ << fi_.exitLabel() << ":\n";
   if (fi_.hasCalls) {
     out_ << "  lw ra, 0(sp)\n";
@@ -183,8 +200,16 @@ void CodeGenerator::visit(ContinueStmt&) {
 void CodeGenerator::visit(ReturnStmt& node) {
   fi_.hasReturn = true;
   if (node.value) {
-    genExpr(*node.value);
-    emit("mv a0, t0");
+    if (dynamic_cast<CallExpr*>(node.value.get())) {
+      // Call already leaves result in a0, skip redundant moves
+      genExpr(*node.value);
+    } else if (optimize_ && isSimpleExpr(*node.value)) {
+      // Load simple expression directly into a0
+      genExprInto(*node.value, "a0");
+    } else {
+      genExpr(*node.value);
+      emit("mv a0, t0");
+    }
   }
   emit("j " + fi_.exitLabel());
 }
@@ -211,6 +236,34 @@ void CodeGenerator::genExpr(Expr& expr) {
     return;
   }
   expr.accept(*this);
+}
+
+// Evaluate expression directly into a named register (avoids mv)
+void CodeGenerator::genExprInto(Expr& expr, const std::string& rd) {
+  if (optimize_ && isConstExpr(expr)) {
+    emit("li " + rd + ", " + std::to_string(evalConstExpr(expr)));
+    return;
+  }
+  if (auto* n = dynamic_cast<NumberExpr*>(&expr)) {
+    emit("li " + rd + ", " + std::to_string(n->value));
+    return;
+  }
+  if (auto* id = dynamic_cast<IdExpr*>(&expr)) {
+    Symbol* sym = symtab_.lookup(id->name);
+    if (!sym) return;
+    if (sym->kind == Symbol::Kind::CONST) {
+      emit("li " + rd + ", " + std::to_string(sym->constValue));
+    } else if (sym->isGlobal) {
+      emit("lui " + rd + ", %hi(g_" + id->name + ")");
+      emit("lw " + rd + ", %lo(g_" + id->name + ")(" + rd + ")");
+    } else {
+      emit("lw " + rd + ", " + std::to_string(sym->frameOffset) + "(sp)");
+    }
+    return;
+  }
+  // Fallback: evaluate to t0 then move to target
+  genExpr(expr);
+  if (rd != "t0") emit("mv " + rd + ", t0");
 }
 
 void CodeGenerator::visit(NumberExpr& node) {
@@ -311,22 +364,30 @@ void CodeGenerator::visit(BinaryExpr& node) {
     }
   }
 
-  genExpr(*node.left);
-  int spillOff = 0;
+  bool leftSimple  = optimize_ && isSimpleExpr(*node.left);
   bool rightSimple = optimize_ && isSimpleExpr(*node.right);
-  if (rightSimple) {
-    emit("mv t1, t0");
-  } else {
-    spillOff = fi_.nextVarOffset + fi_.spillSlot * 4;
-    fi_.spillSlot++;
-    if (fi_.spillSlot > fi_.maxSpillSlots) fi_.maxSpillSlots = fi_.spillSlot;
-    emit("sw t0, " + std::to_string(spillOff) + "(sp)");
-  }
 
-  genExpr(*node.right);
-  if (!rightSimple) {
-    emit("lw t1, " + std::to_string(spillOff) + "(sp)");
-    fi_.spillSlot--;
+  if (leftSimple && rightSimple) {
+    // Both operands simple: load left directly into t1, right into t0
+    genExprInto(*node.left, "t1");
+    genExpr(*node.right);
+  } else {
+    genExpr(*node.left);
+    int spillOff = 0;
+    if (rightSimple) {
+      emit("mv t1, t0");
+    } else {
+      spillOff = fi_.nextVarOffset + fi_.spillSlot * 4;
+      fi_.spillSlot++;
+      if (fi_.spillSlot > fi_.maxSpillSlots) fi_.maxSpillSlots = fi_.spillSlot;
+      emit("sw t0, " + std::to_string(spillOff) + "(sp)");
+    }
+
+    genExpr(*node.right);
+    if (!rightSimple) {
+      emit("lw t1, " + std::to_string(spillOff) + "(sp)");
+      fi_.spillSlot--;
+    }
   }
 
   switch (node.op) {
@@ -385,8 +446,7 @@ void CodeGenerator::visit(CallExpr& node) {
   if (optimize_ && !anyCall) {
     // No arg contains a call: evaluate directly to arg registers (no spills)
     for (int i = 0; i < numArgs && i < 8; ++i) {
-      genExpr(*node.args[i]);
-      emit("mv a" + std::to_string(i) + ", t0");
+      genExprInto(*node.args[i], "a" + std::to_string(i));
     }
     // Args 9+ on stack (outgoing args area)
     for (int i = 8; i < numArgs; ++i) {
@@ -418,12 +478,16 @@ void CodeGenerator::visit(CallExpr& node) {
     }
   }
 
-  emit("call " + node.name);
+  emit("jal ra, " + node.name);
   emit("mv t0, a0");
 }
 
 // ====== Short-circuit ======
 void CodeGenerator::genCond(Expr& cond, const std::string& falseLabel) {
+  if (optimize_ && isConstExpr(cond)) {
+    if (evalConstExpr(cond) == 0) emit("j " + falseLabel);
+    return;
+  }
   if (auto* bin = dynamic_cast<BinaryExpr*>(&cond)) {
     if (bin->op == BinaryExpr::AND) {
       genCond(*bin->left, falseLabel);
@@ -443,6 +507,10 @@ void CodeGenerator::genCond(Expr& cond, const std::string& falseLabel) {
 }
 
 void CodeGenerator::genCondNot(Expr& cond, const std::string& trueLabel) {
+  if (optimize_ && isConstExpr(cond)) {
+    if (evalConstExpr(cond) != 0) emit("j " + trueLabel);
+    return;
+  }
   if (auto* bin = dynamic_cast<BinaryExpr*>(&cond)) {
     if (bin->op == BinaryExpr::OR) {
       genCondNot(*bin->left, trueLabel);
