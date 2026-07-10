@@ -44,10 +44,9 @@ void SemanticAnalyzer::analyze(CompUnit& ast) {
         error(0, 0, "redefinition of global '" + sym.name + "'");
       }
 
-      // Evaluate global initializer (must be constant)
-      if (decl->isConst) {
-        sym.constValue = evaluateConst(*decl->init);
-      }
+      // Evaluate global initializer (must be constant for globals)
+      sym.constValue = evaluateConst(*decl->init);
+      decl->constValue = sym.constValue;
 
       // Update the inserted symbol with constValue
       if (auto* s = symtab_.lookupLocal(sym.name)) {
@@ -290,7 +289,7 @@ int32_t SemanticAnalyzer::evaluateConst(Expr& expr) {
   }
   if (auto* id = dynamic_cast<IdExpr*>(&expr)) {
     Symbol* sym = symtab_.lookup(id->name);
-    if (sym && sym->kind == Symbol::Kind::CONST) {
+    if (sym && (sym->kind == Symbol::Kind::CONST || sym->isGlobal)) {
       return sym->constValue;
     }
     error(0, 0, "'" + id->name + "' is not a compile-time constant");

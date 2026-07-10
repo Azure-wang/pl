@@ -40,10 +40,11 @@ std::string CodeGenerator::generate(CompUnit& ast) {
       sym.kind = decl->isConst ? Symbol::Kind::CONST : Symbol::Kind::VAR;
       sym.type = Type::INT;
       sym.isGlobal = true;
+      int32_t initVal = decl->constValue;
       symtab_.insert(sym);
       dataSection_ << "  .globl g_" << sym.name << "\n";
       dataSection_ << "g_" << sym.name << ":\n";
-      dataSection_ << "  .word 0\n";
+      dataSection_ << "  .word " << std::to_string(initVal) << "\n";
     }
   }
 
@@ -198,7 +199,17 @@ void CodeGenerator::visit(VarDecl& node) {
 }
 
 // ====== Expressions ======
-void CodeGenerator::genExpr(Expr& expr) { expr.accept(*this); }
+void CodeGenerator::genExpr(Expr& expr) {
+  if (optimize_ && isConstExpr(expr)) {
+    emit("li t0, " + std::to_string(evalConstExpr(expr)));
+    return;
+  }
+  expr.accept(*this);
+}
+
+static bool isLeafExpr(Expr& expr) {
+  return dynamic_cast<NumberExpr*>(&expr) || dynamic_cast<IdExpr*>(&expr);
+}
 
 void CodeGenerator::visit(NumberExpr& node) {
   emit("li t0, " + std::to_string(node.value));
@@ -223,13 +234,60 @@ void CodeGenerator::visit(UnaryExpr& node) {
   case UnaryExpr::PLUS: break;
   case UnaryExpr::MINUS: emit("sub t0, zero, t0"); break;
   case UnaryExpr::NOT:
-    emit("snez t0, t0");
+    emit("sltu t0, zero, t0");
     emit("xori t0, t0, 1");
     break;
   }
 }
 
 void CodeGenerator::visit(BinaryExpr& node) {
+  // With -opt and leaf right operand: evaluate right first, save in t3
+  // (t3 is not used by nested BinaryExpr spill code, unlike t1),
+  // then evaluate left into t0, avoiding a spill slot.
+  if (optimize_ && isLeafExpr(*node.right)) {
+    genExpr(*node.right);
+    emit("mv t3, t0");
+    genExpr(*node.left);
+    emit("mv t1, t3");
+    // t0 = left, t1 = right
+    switch (node.op) {
+    case BinaryExpr::ADD: emit("add t0, t0, t1"); break;
+    case BinaryExpr::SUB: emit("sub t0, t0, t1"); break;
+    case BinaryExpr::MUL: emit("mul t0, t0, t1"); break;
+    case BinaryExpr::DIV: emit("div t0, t0, t1"); break;
+    case BinaryExpr::MOD: emit("rem t0, t0, t1"); break;
+    case BinaryExpr::LT:  emit("slt t0, t0, t1"); break;
+    case BinaryExpr::GT:  emit("slt t0, t1, t0"); break;
+    case BinaryExpr::LE:
+      emit("slt t2, t1, t0");
+      emit("xori t0, t2, 1");
+      break;
+    case BinaryExpr::GE:
+      emit("slt t2, t0, t1");
+      emit("xori t0, t2, 1");
+      break;
+    case BinaryExpr::EQ:
+      emit("sub t2, t0, t1");
+      emit("sltiu t0, t2, 1");
+      break;
+    case BinaryExpr::NEQ:
+      emit("sub t2, t0, t1");
+      emit("sltu t0, zero, t2");
+      break;
+    case BinaryExpr::AND:
+      emit("sltu t1, zero, t1");
+      emit("sltu t0, zero, t0");
+      emit("and t0, t1, t0");
+      break;
+    case BinaryExpr::OR:
+      emit("sltu t1, zero, t1");
+      emit("sltu t0, zero, t0");
+      emit("or t0, t1, t0");
+      break;
+    }
+    return;
+  }
+
   genExpr(*node.left);
   int spillOff = fi_.nextVarOffset + fi_.spillSlot * 4;
   fi_.spillSlot++;
@@ -265,26 +323,52 @@ void CodeGenerator::visit(BinaryExpr& node) {
     emit("sltu t0, zero, t2");
     break;
   case BinaryExpr::AND:
-    emit("snez t1, t1");
-    emit("snez t0, t0");
+    emit("sltu t1, zero, t1");
+    emit("sltu t0, zero, t0");
     emit("and t0, t1, t0");
     break;
   case BinaryExpr::OR:
-    emit("snez t1, t1");
-    emit("snez t0, t0");
+    emit("sltu t1, zero, t1");
+    emit("sltu t0, zero, t0");
     emit("or t0, t1, t0");
     break;
   }
 }
 
 void CodeGenerator::visit(CallExpr& node) {
-  for (size_t i = 0; i < node.args.size() && i < 4; ++i) {
+  int savedSpill = fi_.spillSlot;
+  int numArgs = (int)node.args.size();
+
+  // Evaluate all args left-to-right, saving each to a spill slot.
+  // This prevents arg register clobbering when an arg expression
+  // itself contains a function call.
+  for (int i = 0; i < numArgs; ++i) {
     genExpr(*node.args[i]);
-    emit("mv a" + std::to_string(i) + ", t0");
+    int off = fi_.nextVarOffset + fi_.spillSlot * 4;
+    fi_.spillSlot++;
+    if (fi_.spillSlot > fi_.maxSpillSlots) fi_.maxSpillSlots = fi_.spillSlot;
+    emit("sw t0, " + std::to_string(off) + "(sp)");
   }
-  if ((int)node.args.size() > fi_.maxArgs) {
-    fi_.maxArgs = (int)node.args.size();
+
+  if (numArgs > fi_.maxArgs) {
+    fi_.maxArgs = numArgs;
   }
+
+  fi_.spillSlot = savedSpill;
+
+  // Load first 4 args into a0-a3
+  for (int i = 0; i < numArgs && i < 4; ++i) {
+    int off = fi_.nextVarOffset + (savedSpill + i) * 4;
+    emit("lw a" + std::to_string(i) + ", " + std::to_string(off) + "(sp)");
+  }
+
+  // Args 5+ go on the stack (at caller's sp)
+  for (int i = 4; i < numArgs; ++i) {
+    int off = fi_.nextVarOffset + (savedSpill + i) * 4;
+    emit("lw t1, " + std::to_string(off) + "(sp)");
+    emit("sw t1, " + std::to_string((i - 4) * 4) + "(sp)");
+  }
+
   emit("call " + node.name);
   emit("mv t0, a0");
 }
@@ -326,6 +410,58 @@ void CodeGenerator::genCondNot(Expr& cond, const std::string& trueLabel) {
   }
   genExpr(cond);
   emit("bnez t0, " + trueLabel);
+}
+
+// ====== Constant folding ======
+bool CodeGenerator::isConstExpr(Expr& expr) {
+  if (dynamic_cast<NumberExpr*>(&expr)) return true;
+  if (auto* id = dynamic_cast<IdExpr*>(&expr)) {
+    Symbol* sym = symtab_.lookup(id->name);
+    return sym && sym->kind == Symbol::Kind::CONST;
+  }
+  if (auto* un = dynamic_cast<UnaryExpr*>(&expr)) {
+    return isConstExpr(*un->operand);
+  }
+  if (auto* bin = dynamic_cast<BinaryExpr*>(&expr)) {
+    return isConstExpr(*bin->left) && isConstExpr(*bin->right);
+  }
+  return false;
+}
+
+int32_t CodeGenerator::evalConstExpr(Expr& expr) {
+  if (auto* n = dynamic_cast<NumberExpr*>(&expr)) return n->value;
+  if (auto* id = dynamic_cast<IdExpr*>(&expr)) {
+    Symbol* sym = symtab_.lookup(id->name);
+    return sym ? sym->constValue : 0;
+  }
+  if (auto* un = dynamic_cast<UnaryExpr*>(&expr)) {
+    int32_t v = evalConstExpr(*un->operand);
+    switch (un->op) {
+    case UnaryExpr::PLUS:  return v;
+    case UnaryExpr::MINUS: return -v;
+    case UnaryExpr::NOT:   return !v;
+    }
+  }
+  if (auto* bin = dynamic_cast<BinaryExpr*>(&expr)) {
+    int32_t l = evalConstExpr(*bin->left);
+    int32_t r = evalConstExpr(*bin->right);
+    switch (bin->op) {
+    case BinaryExpr::ADD: return l + r;
+    case BinaryExpr::SUB: return l - r;
+    case BinaryExpr::MUL: return l * r;
+    case BinaryExpr::DIV: return r != 0 ? l / r : 0;
+    case BinaryExpr::MOD: return r != 0 ? l % r : 0;
+    case BinaryExpr::LT:  return l < r;
+    case BinaryExpr::GT:  return l > r;
+    case BinaryExpr::LE:  return l <= r;
+    case BinaryExpr::GE:  return l >= r;
+    case BinaryExpr::EQ:  return l == r;
+    case BinaryExpr::NEQ: return l != r;
+    case BinaryExpr::AND: return l && r;
+    case BinaryExpr::OR:  return l || r;
+    }
+  }
+  return 0;
 }
 
 }  // namespace toyc

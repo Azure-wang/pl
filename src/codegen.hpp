@@ -66,6 +66,9 @@ private:
   std::string newLabel(const std::string& prefix);
 
   void genExpr(Expr& expr);
+  // Constant folding helpers (used with -opt)
+  bool isConstExpr(Expr& expr);
+  int32_t evalConstExpr(Expr& expr);
   // Short-circuit cond: branch to label if condition is false
   void genCond(Expr& cond, const std::string& falseLabel);
   // Inverse: branch to label if condition is true
