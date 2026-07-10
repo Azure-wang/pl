@@ -82,18 +82,26 @@ void CodeGenerator::visit(FuncDef& node) {
   outPtr_ = &body;
 
   // Allocate parameters
+  // RISC-V: a0-a7 for first 8 params, stack for params 9+
   for (size_t i = 0; i < node.params.size(); ++i) {
     Symbol sym;
     sym.name = node.params[i].name;
     sym.kind = Symbol::Kind::PARAM;
     sym.type = Type::INT;
     sym.frameOffset = fi_.nextVarOffset;
-    sym.paramReg = (int)i;
+    sym.paramReg = (i < 8) ? (int)i : -1;
     fi_.nextVarOffset += 4;
     fi_.frameSize += 4;
     symtab_.insert(sym);
-    emit("sw a" + std::to_string(i) + ", " +
-         std::to_string(sym.frameOffset) + "(sp)");
+    if (i < 8) {
+      emit("sw a" + std::to_string(i) + ", " +
+           std::to_string(sym.frameOffset) + "(sp)");
+    } else {
+      // Load from caller's stack: param is at sp_old + (i-8)*4
+      // sp_old = sp + totalFrame, use _TF_ placeholder resolved later
+      emit("lw t1, _TF_+" + std::to_string((i - 8) * 4) + "(sp)");
+      emit("sw t1, " + std::to_string(sym.frameOffset) + "(sp)");
+    }
   }
 
   // Walk body -> goes into body buffer
@@ -106,7 +114,7 @@ void CodeGenerator::visit(FuncDef& node) {
 
   // Calculate frame size
   int spillsArea = fi_.maxSpillSlots * 4;
-  int argsArea = fi_.maxArgs * 4;
+  int argsArea = std::max(0, fi_.maxArgs - 8) * 4;  // only stack args (9+)
   // For leaf functions with no locals/spills, skip frame entirely
   // (ra and params are handled via registers, no stack needed)
   bool skipFrame = !fi_.hasCalls && spillsArea == 0 && argsArea == 0 &&
@@ -116,11 +124,35 @@ void CodeGenerator::visit(FuncDef& node) {
 
   // Peephole: remove dead "mv t0, a0" before unconditional jumps
   std::string bodyStr = body.str();
+
+  // Resolve _TF_ placeholders (total frame for stack-passed params 9+)
+  {
+    std::string tf = std::to_string(totalFrame);
+    size_t pos = 0;
+    while ((pos = bodyStr.find("_TF_+", pos)) != std::string::npos) {
+      size_t numStart = pos + 5;
+      size_t numEnd = bodyStr.find('(', numStart);
+      if (numEnd == std::string::npos) break;
+      int off = std::stoi(bodyStr.substr(numStart, numEnd - numStart));
+      std::string repl = std::to_string(totalFrame + off);
+      bodyStr.replace(pos, numEnd - pos, repl);
+      pos += repl.length();
+    }
+  }
+
   if (optimize_) {
     // For leaf functions, strip param stores (registers never clobbered)
+    // Only strip sw from registers (params 0-7). Stack params (8+) need lw+sw kept.
     if (!fi_.hasCalls && node.params.size() > 0) {
-      size_t stripPos = 0;
+      int linesToStrip = 0;
       for (size_t i = 0; i < node.params.size(); ++i) {
+        linesToStrip += (i < 8) ? 1 : 2;  // sw for reg params, lw+sw for stack params
+      }
+      // Only strip register param stores (the sw lines), keep stack param loads
+      int regParamLines = 0;
+      for (size_t i = 0; i < node.params.size() && i < 8; ++i) regParamLines++;
+      size_t stripPos = 0;
+      for (int i = 0; i < regParamLines; ++i) {
         stripPos = bodyStr.find('\n', stripPos);
         if (stripPos == std::string::npos) break;
         stripPos++;
@@ -202,6 +234,16 @@ void CodeGenerator::visit(FuncDef& node) {
     }
   }
 
+  // Remove dead jump to exit label: "  j .L_xxx_exit\n" when exit label follows
+  {
+    std::string exitJump = "  j " + fi_.exitLabel() + "\n";
+    if (bodyStr.length() >= exitJump.length() &&
+        bodyStr.compare(bodyStr.length() - exitJump.length(),
+                        exitJump.length(), exitJump) == 0) {
+      bodyStr.erase(bodyStr.length() - exitJump.length());
+    }
+  }
+
   // Output function
   if (node.name == "main") {
     out_ << "\n  .globl main\n";
@@ -213,14 +255,14 @@ void CodeGenerator::visit(FuncDef& node) {
   if (!skipFrame) {
     out_ << "  addi sp, sp, -" << totalFrame << "\n";
     if (fi_.hasCalls) {
-      out_ << "  sw ra, 0(sp)\n";
+      out_ << "  sw ra, " << (totalFrame - 4) << "(sp)\n";
     }
   }
   out_ << bodyStr;
   out_ << fi_.exitLabel() << ":\n";
   if (!skipFrame) {
     if (fi_.hasCalls) {
-      out_ << "  lw ra, 0(sp)\n";
+      out_ << "  lw ra, " << (totalFrame - 4) << "(sp)\n";
     }
     out_ << "  addi sp, sp, " << totalFrame << "\n";
   }
@@ -249,6 +291,11 @@ void CodeGenerator::visit(AssignStmt& node) {
   } else {
     int off = sym ? sym->frameOffset : 0;
     emit("sw t0, " + std::to_string(off) + "(sp)");
+    // Param modified: disable register optimization so subsequent reads
+    // go to the stack (which has the updated value)
+    if (sym && sym->kind == Symbol::Kind::PARAM) {
+      sym->paramReg = -1;
+    }
   }
 }
 
@@ -287,10 +334,10 @@ void CodeGenerator::visit(ReturnStmt& node) {
   fi_.hasReturn = true;
   if (node.value) {
     if (dynamic_cast<CallExpr*>(node.value.get())) {
-      // Call already leaves result in a0, skip redundant moves
+      // Call already leaves result in a0
       genExpr(*node.value);
-    } else if (optimize_ && isSimpleExpr(*node.value)) {
-      // Load simple expression directly into a0
+    } else if (optimize_) {
+      // genExprInto handles constants, simple exprs, and binary ops
       genExprInto(*node.value, "a0");
     } else {
       genExpr(*node.value);
@@ -385,6 +432,65 @@ void CodeGenerator::genExprInto(Expr& expr, const std::string& rd) {
         if (bin->op == BinaryExpr::MUL && isPowerOf2(v) && v > 0) {
           genExprInto(*bin->right, rd);
           emit("slli " + rd + ", " + rd + ", " + std::to_string(ilog2(v)));
+          return;
+        }
+      }
+      // Both operands simple: compute directly into rd
+      if (isSimpleExpr(*bin->left) && isSimpleExpr(*bin->right)) {
+        // If right is a param in a register, use it directly (avoids mv to t1)
+        // Exception: AND/OR clobber the register via sltu, so use t1 instead
+        std::string rs = "t1";
+        bool rightIsParamReg = false;
+        if (auto* idR = dynamic_cast<IdExpr*>(bin->right.get())) {
+          Symbol* symR = symtab_.lookup(idR->name);
+          if (symR && symR->kind == Symbol::Kind::PARAM &&
+              symR->paramReg >= 0 && !fi_.hasCalls &&
+              bin->op != BinaryExpr::AND && bin->op != BinaryExpr::OR) {
+            rs = "a" + std::to_string(symR->paramReg);
+            rightIsParamReg = true;
+          }
+        }
+        if (rightIsParamReg && rs == rd) {
+          rightIsParamReg = false;
+          genExprInto(*bin->right, "t1");
+          rs = "t1";
+        } else if (!rightIsParamReg) {
+          genExprInto(*bin->right, "t1");
+        }
+        genExprInto(*bin->left, rd);
+        switch (bin->op) {
+        case BinaryExpr::ADD: emit("add " + rd + ", " + rd + ", " + rs); return;
+        case BinaryExpr::SUB: emit("sub " + rd + ", " + rd + ", " + rs); return;
+        case BinaryExpr::MUL: emit("mul " + rd + ", " + rd + ", " + rs); return;
+        case BinaryExpr::DIV: emit("div " + rd + ", " + rd + ", " + rs); return;
+        case BinaryExpr::MOD: emit("rem " + rd + ", " + rd + ", " + rs); return;
+        case BinaryExpr::LT:  emit("slt " + rd + ", " + rd + ", " + rs); return;
+        case BinaryExpr::GT:  emit("slt " + rd + ", " + rs + ", " + rd); return;
+        case BinaryExpr::LE:
+          emit("slt " + rd + ", " + rs + ", " + rd);
+          emit("xori " + rd + ", " + rd + ", 1");
+          return;
+        case BinaryExpr::GE:
+          emit("slt " + rd + ", " + rd + ", " + rs);
+          emit("xori " + rd + ", " + rd + ", 1");
+          return;
+        case BinaryExpr::EQ:
+          emit("sub " + rd + ", " + rd + ", " + rs);
+          emit("sltiu " + rd + ", " + rd + ", 1");
+          return;
+        case BinaryExpr::NEQ:
+          emit("sub " + rd + ", " + rd + ", " + rs);
+          emit("sltu " + rd + ", zero, " + rd);
+          return;
+        case BinaryExpr::AND:
+          emit("sltu " + rd + ", zero, " + rd);
+          emit("sltu " + rs + ", zero, " + rs);
+          emit("and " + rd + ", " + rd + ", " + rs);
+          return;
+        case BinaryExpr::OR:
+          emit("sltu " + rd + ", zero, " + rd);
+          emit("sltu " + rs + ", zero, " + rs);
+          emit("or " + rd + ", " + rd + ", " + rs);
           return;
         }
       }
@@ -589,11 +695,10 @@ void CodeGenerator::visit(CallExpr& node) {
     for (int i = 0; i < numArgs && i < 8; ++i) {
       genExprInto(*node.args[i], "a" + std::to_string(i));
     }
-    // Args 9+ on stack (outgoing args area)
+    // Args 9+ on stack (outgoing args area, at sp+0, sp+4, ...)
     for (int i = 8; i < numArgs; ++i) {
       genExpr(*node.args[i]);
-      int outOff = fi_.frameSize + fi_.maxSpillSlots * 4 + (i - 8) * 4;
-      emit("sw t0, " + std::to_string(outOff) + "(sp)");
+      emit("sw t0, " + std::to_string((i - 8) * 4) + "(sp)");
     }
   } else {
     // Standard: evaluate all args, spill, then reload into a0-a7
@@ -643,6 +748,20 @@ void CodeGenerator::genCond(Expr& cond, const std::string& falseLabel) {
       emitLabel(skipL);
       return;
     }
+    // Direct branch for simple comparison: avoid computing boolean in t0
+    if (optimize_ && isSimpleExpr(*bin->left) && isSimpleExpr(*bin->right)) {
+      genExprInto(*bin->left, "t0");
+      genExprInto(*bin->right, "t1");
+      switch (bin->op) {
+      case BinaryExpr::LT:  emit("bge t0, t1, " + falseLabel); return;
+      case BinaryExpr::GT:  emit("bge t1, t0, " + falseLabel); return;
+      case BinaryExpr::LE:  emit("blt t1, t0, " + falseLabel); return;
+      case BinaryExpr::GE:  emit("blt t0, t1, " + falseLabel); return;
+      case BinaryExpr::EQ:  emit("bne t0, t1, " + falseLabel); return;
+      case BinaryExpr::NEQ: emit("beq t0, t1, " + falseLabel); return;
+      default: break;
+      }
+    }
   }
   genExpr(cond);
   emit("beqz t0, " + falseLabel);
@@ -665,6 +784,20 @@ void CodeGenerator::genCondNot(Expr& cond, const std::string& trueLabel) {
       genCondNot(*bin->right, trueLabel);
       emitLabel(skipL);
       return;
+    }
+    // Direct branch for simple comparison
+    if (optimize_ && isSimpleExpr(*bin->left) && isSimpleExpr(*bin->right)) {
+      genExprInto(*bin->left, "t0");
+      genExprInto(*bin->right, "t1");
+      switch (bin->op) {
+      case BinaryExpr::LT:  emit("blt t0, t1, " + trueLabel); return;
+      case BinaryExpr::GT:  emit("blt t1, t0, " + trueLabel); return;
+      case BinaryExpr::LE:  emit("bge t1, t0, " + trueLabel); return;
+      case BinaryExpr::GE:  emit("bge t0, t1, " + trueLabel); return;
+      case BinaryExpr::EQ:  emit("beq t0, t1, " + trueLabel); return;
+      case BinaryExpr::NEQ: emit("bne t0, t1, " + trueLabel); return;
+      default: break;
+      }
     }
   }
   genExpr(cond);

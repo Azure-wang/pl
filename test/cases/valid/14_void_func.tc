@@ -1,0 +1,10 @@
+int g = 0;
+
+void set(int v) {
+  g = v;
+}
+
+int main() {
+  set(42);
+  return g;
+}
