@@ -41,6 +41,7 @@ std::string CodeGenerator::generate(CompUnit& ast) {
       sym.type = Type::INT;
       sym.isGlobal = true;
       int32_t initVal = decl->constValue;
+      sym.constValue = initVal;
       symtab_.insert(sym);
       dataSection_ << "  .globl g_" << sym.name << "\n";
       dataSection_ << "g_" << sym.name << ":\n";
@@ -88,7 +89,7 @@ void CodeGenerator::visit(FuncDef& node) {
          std::to_string(sym.frameOffset) + "(sp)");
   }
 
-  // Walk body → goes into body buffer
+  // Walk body -> goes into body buffer
   for (auto& stmt : node.body->stmts) {
     stmt->accept(*this);
   }
@@ -96,7 +97,7 @@ void CodeGenerator::visit(FuncDef& node) {
   // Restore output to main stream
   outPtr_ = &out_;
 
-  // Calculate frame size
+  // Calculate frame size (always reserve ra slot at 0(sp) for simplicity)
   int spillsArea = fi_.maxSpillSlots * 4;
   int argsArea = fi_.maxArgs * 4;
   int totalFrame = fi_.frameSize + spillsArea + argsArea;
@@ -108,12 +109,17 @@ void CodeGenerator::visit(FuncDef& node) {
   }
   out_ << node.name << ":\n";
   out_ << "  # frame=" << totalFrame << " locals=" << (fi_.frameSize - 4)
-       << " spills=" << spillsArea << " args=" << argsArea << "\n";
+       << " spills=" << spillsArea << " args=" << argsArea
+       << " leaf=" << (fi_.hasCalls ? "0" : "1") << "\n";
   out_ << "  addi sp, sp, -" << totalFrame << "\n";
-  out_ << "  sw ra, 0(sp)\n";
+  if (fi_.hasCalls) {
+    out_ << "  sw ra, 0(sp)\n";
+  }
   out_ << body.str();
   out_ << fi_.exitLabel() << ":\n";
-  out_ << "  lw ra, 0(sp)\n";
+  if (fi_.hasCalls) {
+    out_ << "  lw ra, 0(sp)\n";
+  }
   out_ << "  addi sp, sp, " << totalFrame << "\n";
   out_ << "  ret\n";
 
@@ -207,10 +213,6 @@ void CodeGenerator::genExpr(Expr& expr) {
   expr.accept(*this);
 }
 
-static bool isLeafExpr(Expr& expr) {
-  return dynamic_cast<NumberExpr*>(&expr) || dynamic_cast<IdExpr*>(&expr);
-}
-
 void CodeGenerator::visit(NumberExpr& node) {
   emit("li t0, " + std::to_string(node.value));
 }
@@ -240,52 +242,34 @@ void CodeGenerator::visit(UnaryExpr& node) {
   }
 }
 
+// Check if n is a power of 2
+static bool isPowerOf2(int32_t n) {
+  return n > 0 && (n & (n - 1)) == 0;
+}
+
+static int ilog2(int32_t n) {
+  int r = 0;
+  while (n >>= 1) r++;
+  return r;
+}
+
 void CodeGenerator::visit(BinaryExpr& node) {
-  // With -opt and leaf right operand: evaluate right first, save in t3
-  // (t3 is not used by nested BinaryExpr spill code, unlike t1),
-  // then evaluate left into t0, avoiding a spill slot.
-  if (optimize_ && isLeafExpr(*node.right)) {
-    genExpr(*node.right);
-    emit("mv t3, t0");
-    genExpr(*node.left);
-    emit("mv t1, t3");
-    // t0 = left, t1 = right
-    switch (node.op) {
-    case BinaryExpr::ADD: emit("add t0, t0, t1"); break;
-    case BinaryExpr::SUB: emit("sub t0, t0, t1"); break;
-    case BinaryExpr::MUL: emit("mul t0, t0, t1"); break;
-    case BinaryExpr::DIV: emit("div t0, t0, t1"); break;
-    case BinaryExpr::MOD: emit("rem t0, t0, t1"); break;
-    case BinaryExpr::LT:  emit("slt t0, t0, t1"); break;
-    case BinaryExpr::GT:  emit("slt t0, t1, t0"); break;
-    case BinaryExpr::LE:
-      emit("slt t2, t1, t0");
-      emit("xori t0, t2, 1");
-      break;
-    case BinaryExpr::GE:
-      emit("slt t2, t0, t1");
-      emit("xori t0, t2, 1");
-      break;
-    case BinaryExpr::EQ:
-      emit("sub t2, t0, t1");
-      emit("sltiu t0, t2, 1");
-      break;
-    case BinaryExpr::NEQ:
-      emit("sub t2, t0, t1");
-      emit("sltu t0, zero, t2");
-      break;
-    case BinaryExpr::AND:
-      emit("sltu t1, zero, t1");
-      emit("sltu t0, zero, t0");
-      emit("and t0, t1, t0");
-      break;
-    case BinaryExpr::OR:
-      emit("sltu t1, zero, t1");
-      emit("sltu t0, zero, t0");
-      emit("or t0, t1, t0");
-      break;
+  // Strength reduction for MUL by constant power of 2 (with -opt)
+  if (optimize_ && node.op == BinaryExpr::MUL) {
+    if (auto* numR = dynamic_cast<NumberExpr*>(node.right.get())) {
+      if (isPowerOf2(numR->value)) {
+        genExpr(*node.left);
+        emit("slli t0, t0, " + std::to_string(ilog2(numR->value)));
+        return;
+      }
     }
-    return;
+    if (auto* numL = dynamic_cast<NumberExpr*>(node.left.get())) {
+      if (isPowerOf2(numL->value)) {
+        genExpr(*node.right);
+        emit("slli t0, t0, " + std::to_string(ilog2(numL->value)));
+        return;
+      }
+    }
   }
 
   genExpr(*node.left);
@@ -336,12 +320,12 @@ void CodeGenerator::visit(BinaryExpr& node) {
 }
 
 void CodeGenerator::visit(CallExpr& node) {
+  fi_.hasCalls = true;
+
   int savedSpill = fi_.spillSlot;
   int numArgs = (int)node.args.size();
 
-  // Evaluate all args left-to-right, saving each to a spill slot.
-  // This prevents arg register clobbering when an arg expression
-  // itself contains a function call.
+  // Evaluate all args left-to-right, saving each to a spill slot
   for (int i = 0; i < numArgs; ++i) {
     genExpr(*node.args[i]);
     int off = fi_.nextVarOffset + fi_.spillSlot * 4;
@@ -356,17 +340,17 @@ void CodeGenerator::visit(CallExpr& node) {
 
   fi_.spillSlot = savedSpill;
 
-  // Load first 4 args into a0-a3
-  for (int i = 0; i < numArgs && i < 4; ++i) {
+  // Load up to 8 args into a0-a7 (RISC-V register args)
+  for (int i = 0; i < numArgs && i < 8; ++i) {
     int off = fi_.nextVarOffset + (savedSpill + i) * 4;
     emit("lw a" + std::to_string(i) + ", " + std::to_string(off) + "(sp)");
   }
 
-  // Args 5+ go on the stack (at caller's sp)
-  for (int i = 4; i < numArgs; ++i) {
+  // Args 9+ go on the stack
+  for (int i = 8; i < numArgs; ++i) {
     int off = fi_.nextVarOffset + (savedSpill + i) * 4;
     emit("lw t1, " + std::to_string(off) + "(sp)");
-    emit("sw t1, " + std::to_string((i - 4) * 4) + "(sp)");
+    emit("sw t1, " + std::to_string((i - 8) * 4) + "(sp)");
   }
 
   emit("call " + node.name);

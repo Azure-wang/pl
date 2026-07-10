@@ -50,6 +50,7 @@ private:
     int maxSpillSlots = 0;
     int maxArgs = 0;
     bool hasReturn = false;
+    bool hasCalls = false;
     std::string exitLabel() const { return ".L_" + name + "_exit"; }
   };
   FuncInfo fi_;
