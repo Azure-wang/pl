@@ -1,0 +1,6 @@
+int main() {
+  const int x = 5;
+  const int y = 10;
+  int z = x + y;
+  return z;
+}
