@@ -17,6 +17,7 @@ struct Symbol {
 
   int32_t constValue = 0;
   int frameOffset = 0;
+  int paramReg = -1;   // a0-a7 register index for parameters, -1 if not a param
   bool isGlobal = false;
   bool assigned = false;
 

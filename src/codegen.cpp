@@ -88,6 +88,7 @@ void CodeGenerator::visit(FuncDef& node) {
     sym.kind = Symbol::Kind::PARAM;
     sym.type = Type::INT;
     sym.frameOffset = fi_.nextVarOffset;
+    sym.paramReg = (int)i;
     fi_.nextVarOffset += 4;
     fi_.frameSize += 4;
     symtab_.insert(sym);
@@ -103,20 +104,101 @@ void CodeGenerator::visit(FuncDef& node) {
   // Restore output to main stream
   outPtr_ = &out_;
 
-  // Calculate frame size (always reserve ra slot at 0(sp) for simplicity)
+  // Calculate frame size
   int spillsArea = fi_.maxSpillSlots * 4;
   int argsArea = fi_.maxArgs * 4;
-  int totalFrame = fi_.frameSize + spillsArea + argsArea;
+  // For leaf functions with no locals/spills, skip frame entirely
+  // (ra and params are handled via registers, no stack needed)
+  bool skipFrame = !fi_.hasCalls && spillsArea == 0 && argsArea == 0 &&
+                   fi_.frameSize == 4 + (int)node.params.size() * 4;
+  int totalFrame = skipFrame ? 0 : fi_.frameSize + spillsArea + argsArea;
   totalFrame = (totalFrame + 15) & ~15;
 
   // Peephole: remove dead "mv t0, a0" before unconditional jumps
   std::string bodyStr = body.str();
   if (optimize_) {
+    // For leaf functions, strip param stores (registers never clobbered)
+    if (!fi_.hasCalls && node.params.size() > 0) {
+      size_t stripPos = 0;
+      for (size_t i = 0; i < node.params.size(); ++i) {
+        stripPos = bodyStr.find('\n', stripPos);
+        if (stripPos == std::string::npos) break;
+        stripPos++;
+      }
+      if (stripPos != std::string::npos && stripPos <= bodyStr.length()) {
+        bodyStr.erase(0, stripPos);
+      }
+    }
     std::string pat = "  mv t0, a0\n  j ";
     size_t pos = 0;
     while ((pos = bodyStr.find(pat, pos)) != std::string::npos) {
       bodyStr.replace(pos, pat.length(), "  j ");
       pos += 4;
+    }
+
+    // Remove dead "j LABEL" when immediately followed by "LABEL:"
+    pos = 0;
+    while ((pos = bodyStr.find("  j .", pos)) != std::string::npos) {
+      size_t nlPos = bodyStr.find('\n', pos);
+      if (nlPos == std::string::npos) break;
+      std::string label = bodyStr.substr(pos + 4, nlPos - (pos + 4));
+      std::string nextLine = "\n" + label + ":\n";
+      if (bodyStr.compare(nlPos, nextLine.length(), nextLine) == 0) {
+        bodyStr.erase(pos, nlPos - pos);
+        pos += nextLine.length();
+      } else {
+        pos = nlPos + 1;
+      }
+    }
+
+    // Remove dead non-label instructions after unconditional jumps
+    // Two consecutive non-label lines after "j X" means the second is unreachable
+    pos = 0;
+    while ((pos = bodyStr.find("\n  j ", pos)) != std::string::npos) {
+      size_t jEnd = bodyStr.find('\n', pos + 1);
+      if (jEnd == std::string::npos) break;
+      size_t delStart = jEnd + 1;
+      while (delStart < bodyStr.length()) {
+        size_t delEnd = bodyStr.find('\n', delStart);
+        if (delEnd == std::string::npos) break;
+        std::string line = bodyStr.substr(delStart, delEnd - delStart);
+        // Stop at labels (branch targets) or blank lines
+        if (line.empty() || line.back() == ':') break;
+        // This is dead code - remove it
+        bodyStr.erase(delStart, delEnd - delStart + 1);
+      }
+      pos = jEnd + 1;
+    }
+
+    // Save return value directly: "mv t0, a0; sw t0, N(sp)" → "sw a0, N(sp)"
+    // "  mv t0, a0\n" is 12 chars
+    pos = 0;
+    while ((pos = bodyStr.find("  mv t0, a0\n  sw t0, ", pos)) != std::string::npos) {
+      size_t swStart = pos + 12;
+      size_t swEnd = bodyStr.find('\n', swStart);
+      std::string swLine = bodyStr.substr(swStart, swEnd - swStart);
+      size_t t0Pos = swLine.find("t0");
+      if (t0Pos != std::string::npos) swLine.replace(t0Pos, 2, "a0");
+      bodyStr.replace(pos, swEnd - pos, swLine);
+      pos += swLine.length() + 1;
+    }
+
+    // Fold: "mv t0, a0; lw t1, N(sp); add t0, t1, t0; mv a0, t0"
+    //    → "lw t1, N(sp); add a0, t1, a0"
+    pos = 0;
+    while ((pos = bodyStr.find("  mv t0, a0\n  lw t1, ", pos)) != std::string::npos) {
+      size_t lwStart = pos + 12;
+      size_t lwEnd = bodyStr.find('\n', lwStart);
+      std::string lwLine = bodyStr.substr(lwStart, lwEnd - lwStart);
+      size_t afterLw = lwEnd + 1;
+      std::string rest = "  add t0, t1, t0\n  mv a0, t0\n";
+      if (bodyStr.substr(afterLw, rest.length()) == rest) {
+        bodyStr.replace(pos, afterLw + rest.length() - pos,
+                        lwLine + "\n  add a0, t1, a0\n");
+        pos += lwLine.length() + 18;  // \n + "  add a0, t1, a0" + \n
+      } else {
+        pos = afterLw;
+      }
     }
   }
 
@@ -128,16 +210,20 @@ void CodeGenerator::visit(FuncDef& node) {
   out_ << "  # frame=" << totalFrame << " locals=" << (fi_.frameSize - 4)
        << " spills=" << spillsArea << " args=" << argsArea
        << " leaf=" << (fi_.hasCalls ? "0" : "1") << "\n";
-  out_ << "  addi sp, sp, -" << totalFrame << "\n";
-  if (fi_.hasCalls) {
-    out_ << "  sw ra, 0(sp)\n";
+  if (!skipFrame) {
+    out_ << "  addi sp, sp, -" << totalFrame << "\n";
+    if (fi_.hasCalls) {
+      out_ << "  sw ra, 0(sp)\n";
+    }
   }
   out_ << bodyStr;
   out_ << fi_.exitLabel() << ":\n";
-  if (fi_.hasCalls) {
-    out_ << "  lw ra, 0(sp)\n";
+  if (!skipFrame) {
+    if (fi_.hasCalls) {
+      out_ << "  lw ra, 0(sp)\n";
+    }
+    out_ << "  addi sp, sp, " << totalFrame << "\n";
   }
-  out_ << "  addi sp, sp, " << totalFrame << "\n";
   out_ << "  ret\n";
 
   symtab_.exitScope();
@@ -256,10 +342,53 @@ void CodeGenerator::genExprInto(Expr& expr, const std::string& rd) {
     } else if (sym->isGlobal) {
       emit("lui " + rd + ", %hi(g_" + id->name + ")");
       emit("lw " + rd + ", %lo(g_" + id->name + ")(" + rd + ")");
+    } else if (sym->kind == Symbol::Kind::PARAM && sym->paramReg >= 0 && !fi_.hasCalls) {
+      if (rd != "a" + std::to_string(sym->paramReg)) {
+        emit("mv " + rd + ", a" + std::to_string(sym->paramReg));
+      }
     } else {
       emit("lw " + rd + ", " + std::to_string(sym->frameOffset) + "(sp)");
     }
     return;
+  }
+  // BinOp with simple left and constant right: compute directly into rd
+  if (optimize_) {
+    if (auto* bin = dynamic_cast<BinaryExpr*>(&expr)) {
+      auto* numR = dynamic_cast<NumberExpr*>(bin->right.get());
+      auto* numL = dynamic_cast<NumberExpr*>(bin->left.get());
+      if (numR && isSimpleExpr(*bin->left)) {
+        int32_t v = numR->value;
+        if (bin->op == BinaryExpr::ADD && v >= -2048 && v <= 2047) {
+          genExprInto(*bin->left, rd);
+          emit("addi " + rd + ", " + rd + ", " + std::to_string(v));
+          return;
+        }
+        if (bin->op == BinaryExpr::SUB && v >= -2047 && v <= 2048) {
+          genExprInto(*bin->left, rd);
+          emit("addi " + rd + ", " + rd + ", " + std::to_string(-v));
+          return;
+        }
+        if (bin->op == BinaryExpr::MUL && isPowerOf2(v) && v > 0) {
+          genExprInto(*bin->left, rd);
+          emit("slli " + rd + ", " + rd + ", " + std::to_string(ilog2(v)));
+          return;
+        }
+      }
+      // Commutative: ADD/MUL with constant on left, simple on right
+      if (numL && isSimpleExpr(*bin->right)) {
+        int32_t v = numL->value;
+        if ((bin->op == BinaryExpr::ADD) && v >= -2048 && v <= 2047) {
+          genExprInto(*bin->right, rd);
+          emit("addi " + rd + ", " + rd + ", " + std::to_string(v));
+          return;
+        }
+        if (bin->op == BinaryExpr::MUL && isPowerOf2(v) && v > 0) {
+          genExprInto(*bin->right, rd);
+          emit("slli " + rd + ", " + rd + ", " + std::to_string(ilog2(v)));
+          return;
+        }
+      }
+    }
   }
   // Fallback: evaluate to t0 then move to target
   genExpr(expr);
@@ -278,6 +407,8 @@ void CodeGenerator::visit(IdExpr& node) {
   } else if (sym->isGlobal) {
     emit("lui t0, %hi(g_" + node.name + ")");
     emit("lw t0, %lo(g_" + node.name + ")(t0)");
+  } else if (sym->kind == Symbol::Kind::PARAM && sym->paramReg >= 0 && !fi_.hasCalls) {
+    emit("mv t0, a" + std::to_string(sym->paramReg));
   } else {
     emit("lw t0, " + std::to_string(sym->frameOffset) + "(sp)");
   }
@@ -361,6 +492,18 @@ void CodeGenerator::visit(BinaryExpr& node) {
         emit("addi t0, t0, " + std::to_string(-v));
         return;
       }
+      // DIV by positive power of 2: use shift sequence
+      if (node.op == BinaryExpr::DIV && isPowerOf2(v) && v > 0) {
+        int shift = ilog2(v);
+        genExpr(*node.left);
+        emit("srai t1, t0, 31");
+        emit("srli t1, t1, " + std::to_string(32 - shift));
+        emit("add t0, t0, t1");
+        emit("srai t0, t0, " + std::to_string(shift));
+        return;
+      }
+      // REM by positive power of 2: x & (D-1) for non-negative only
+      // Skip — too complex for general signed case
     }
   }
 
@@ -428,8 +571,6 @@ void CodeGenerator::visit(BinaryExpr& node) {
 }
 
 void CodeGenerator::visit(CallExpr& node) {
-  fi_.hasCalls = true;
-
   int savedSpill = fi_.spillSlot;
   int numArgs = (int)node.args.size();
 
@@ -478,6 +619,7 @@ void CodeGenerator::visit(CallExpr& node) {
     }
   }
 
+  fi_.hasCalls = true;
   emit("jal ra, " + node.name);
   emit("mv t0, a0");
 }
