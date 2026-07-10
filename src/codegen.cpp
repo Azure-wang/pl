@@ -253,6 +253,28 @@ static int ilog2(int32_t n) {
   return r;
 }
 
+// Check if expression needs no spills: no calls, no nested binary ops
+static bool isSimpleExpr(Expr& expr) {
+  if (dynamic_cast<NumberExpr*>(&expr)) return true;
+  if (dynamic_cast<IdExpr*>(&expr)) return true;
+  if (auto* un = dynamic_cast<UnaryExpr*>(&expr)) {
+    return isSimpleExpr(*un->operand);
+  }
+  return false;
+}
+
+// Check if expression contains a function call
+static bool containsCall(Expr& expr) {
+  if (dynamic_cast<CallExpr*>(&expr)) return true;
+  if (auto* un = dynamic_cast<UnaryExpr*>(&expr)) {
+    return containsCall(*un->operand);
+  }
+  if (auto* bin = dynamic_cast<BinaryExpr*>(&expr)) {
+    return containsCall(*bin->left) || containsCall(*bin->right);
+  }
+  return false;
+}
+
 void CodeGenerator::visit(BinaryExpr& node) {
   // Strength reduction for MUL by constant power of 2 (with -opt)
   if (optimize_ && node.op == BinaryExpr::MUL) {
@@ -272,15 +294,40 @@ void CodeGenerator::visit(BinaryExpr& node) {
     }
   }
 
+  // Use immediate instructions for ADD/SUB with small constants
+  if (optimize_) {
+    if (auto* numR = dynamic_cast<NumberExpr*>(node.right.get())) {
+      int32_t v = numR->value;
+      if (node.op == BinaryExpr::ADD && v >= -2048 && v <= 2047) {
+        genExpr(*node.left);
+        emit("addi t0, t0, " + std::to_string(v));
+        return;
+      }
+      if (node.op == BinaryExpr::SUB && v >= -2047 && v <= 2048) {
+        genExpr(*node.left);
+        emit("addi t0, t0, " + std::to_string(-v));
+        return;
+      }
+    }
+  }
+
   genExpr(*node.left);
-  int spillOff = fi_.nextVarOffset + fi_.spillSlot * 4;
-  fi_.spillSlot++;
-  if (fi_.spillSlot > fi_.maxSpillSlots) fi_.maxSpillSlots = fi_.spillSlot;
-  emit("sw t0, " + std::to_string(spillOff) + "(sp)");
+  int spillOff = 0;
+  bool rightSimple = optimize_ && isSimpleExpr(*node.right);
+  if (rightSimple) {
+    emit("mv t1, t0");
+  } else {
+    spillOff = fi_.nextVarOffset + fi_.spillSlot * 4;
+    fi_.spillSlot++;
+    if (fi_.spillSlot > fi_.maxSpillSlots) fi_.maxSpillSlots = fi_.spillSlot;
+    emit("sw t0, " + std::to_string(spillOff) + "(sp)");
+  }
 
   genExpr(*node.right);
-  emit("lw t1, " + std::to_string(spillOff) + "(sp)");
-  fi_.spillSlot--;
+  if (!rightSimple) {
+    emit("lw t1, " + std::to_string(spillOff) + "(sp)");
+    fi_.spillSlot--;
+  }
 
   switch (node.op) {
   case BinaryExpr::ADD: emit("add t0, t1, t0"); break;
@@ -325,32 +372,50 @@ void CodeGenerator::visit(CallExpr& node) {
   int savedSpill = fi_.spillSlot;
   int numArgs = (int)node.args.size();
 
-  // Evaluate all args left-to-right, saving each to a spill slot
-  for (int i = 0; i < numArgs; ++i) {
-    genExpr(*node.args[i]);
-    int off = fi_.nextVarOffset + fi_.spillSlot * 4;
-    fi_.spillSlot++;
-    if (fi_.spillSlot > fi_.maxSpillSlots) fi_.maxSpillSlots = fi_.spillSlot;
-    emit("sw t0, " + std::to_string(off) + "(sp)");
+  if (numArgs > fi_.maxArgs) fi_.maxArgs = numArgs;
+
+  // Check if any args contain calls (need spill+reload if so)
+  bool anyCall = false;
+  if (optimize_) {
+    for (auto& a : node.args) {
+      if (containsCall(*a)) { anyCall = true; break; }
+    }
   }
 
-  if (numArgs > fi_.maxArgs) {
-    fi_.maxArgs = numArgs;
-  }
+  if (optimize_ && !anyCall) {
+    // No arg contains a call: evaluate directly to arg registers (no spills)
+    for (int i = 0; i < numArgs && i < 8; ++i) {
+      genExpr(*node.args[i]);
+      emit("mv a" + std::to_string(i) + ", t0");
+    }
+    // Args 9+ on stack (outgoing args area)
+    for (int i = 8; i < numArgs; ++i) {
+      genExpr(*node.args[i]);
+      int outOff = fi_.frameSize + fi_.maxSpillSlots * 4 + (i - 8) * 4;
+      emit("sw t0, " + std::to_string(outOff) + "(sp)");
+    }
+  } else {
+    // Standard: evaluate all args, spill, then reload into a0-a7
+    for (int i = 0; i < numArgs; ++i) {
+      genExpr(*node.args[i]);
+      int off = fi_.nextVarOffset + fi_.spillSlot * 4;
+      fi_.spillSlot++;
+      if (fi_.spillSlot > fi_.maxSpillSlots) fi_.maxSpillSlots = fi_.spillSlot;
+      emit("sw t0, " + std::to_string(off) + "(sp)");
+    }
 
-  fi_.spillSlot = savedSpill;
+    fi_.spillSlot = savedSpill;
 
-  // Load up to 8 args into a0-a7 (RISC-V register args)
-  for (int i = 0; i < numArgs && i < 8; ++i) {
-    int off = fi_.nextVarOffset + (savedSpill + i) * 4;
-    emit("lw a" + std::to_string(i) + ", " + std::to_string(off) + "(sp)");
-  }
+    for (int i = 0; i < numArgs && i < 8; ++i) {
+      int off = fi_.nextVarOffset + (savedSpill + i) * 4;
+      emit("lw a" + std::to_string(i) + ", " + std::to_string(off) + "(sp)");
+    }
 
-  // Args 9+ go on the stack
-  for (int i = 8; i < numArgs; ++i) {
-    int off = fi_.nextVarOffset + (savedSpill + i) * 4;
-    emit("lw t1, " + std::to_string(off) + "(sp)");
-    emit("sw t1, " + std::to_string((i - 8) * 4) + "(sp)");
+    for (int i = 8; i < numArgs; ++i) {
+      int off = fi_.nextVarOffset + (savedSpill + i) * 4;
+      emit("lw t1, " + std::to_string(off) + "(sp)");
+      emit("sw t1, " + std::to_string((i - 8) * 4) + "(sp)");
+    }
   }
 
   emit("call " + node.name);

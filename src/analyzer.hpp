@@ -43,6 +43,7 @@ private:
   Type currentFuncReturn_ = Type::VOID;
   bool* hasReturned_ = nullptr;    // tracks if current path has returned
   int loopDepth_ = 0;
+  bool inValueCtx_ = false;        // true when expression value is used
 
   void error(int line, int col, const std::string& msg);
   void checkAssignable(Symbol* sym, int line, int col);

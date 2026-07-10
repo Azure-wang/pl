@@ -143,7 +143,10 @@ void SemanticAnalyzer::visit(ExprStmt& node) {
 }
 
 void SemanticAnalyzer::visit(AssignStmt& node) {
+  bool saved = inValueCtx_;
+  inValueCtx_ = true;
   node.value->accept(*this);
+  inValueCtx_ = saved;
 
   Symbol* sym = symtab_.lookup(node.name);
   if (!sym) {
@@ -155,7 +158,10 @@ void SemanticAnalyzer::visit(AssignStmt& node) {
 }
 
 void SemanticAnalyzer::visit(IfStmt& node) {
+  bool saved = inValueCtx_;
+  inValueCtx_ = true;
   node.condition->accept(*this);
+  inValueCtx_ = saved;
   node.thenBody->accept(*this);
   if (node.elseBody) {
     node.elseBody->accept(*this);
@@ -163,7 +169,10 @@ void SemanticAnalyzer::visit(IfStmt& node) {
 }
 
 void SemanticAnalyzer::visit(WhileStmt& node) {
+  bool saved = inValueCtx_;
+  inValueCtx_ = true;
   node.condition->accept(*this);
+  inValueCtx_ = saved;
   loopDepth_++;
   node.body->accept(*this);
   loopDepth_--;
@@ -183,7 +192,10 @@ void SemanticAnalyzer::visit(ContinueStmt&) {
 
 void SemanticAnalyzer::visit(ReturnStmt& node) {
   if (node.value) {
+    bool saved = inValueCtx_;
+    inValueCtx_ = true;
     node.value->accept(*this);
+    inValueCtx_ = saved;
     if (currentFuncReturn_ == Type::VOID) {
       error(0, 0, "void function should not return a value");
     }
@@ -210,7 +222,10 @@ void SemanticAnalyzer::visit(VarDecl& node) {
   sym.type = Type::INT;
 
   // Check and evaluate initializer
+  bool saved = inValueCtx_;
+  inValueCtx_ = true;
   node.init->accept(*this);
+  inValueCtx_ = saved;
 
   if (node.isConst) {
     sym.constValue = evaluateConst(*node.init);
@@ -236,12 +251,19 @@ void SemanticAnalyzer::visit(IdExpr& node) {
 }
 
 void SemanticAnalyzer::visit(UnaryExpr& node) {
+  bool saved = inValueCtx_;
+  inValueCtx_ = true;
   node.operand->accept(*this);
+  inValueCtx_ = saved;
 }
 
 void SemanticAnalyzer::visit(BinaryExpr& node) {
+  bool saved = inValueCtx_;
+  inValueCtx_ = true;
   node.left->accept(*this);
+  inValueCtx_ = true;
   node.right->accept(*this);
+  inValueCtx_ = saved;
 
   if (node.op == BinaryExpr::DIV || node.op == BinaryExpr::MOD) {
     // Check for division by zero
@@ -263,6 +285,10 @@ void SemanticAnalyzer::visit(CallExpr& node) {
     error(0, 0, "'" + node.name + "' is not a function");
     return;
   }
+  if (sym->type == Type::VOID && inValueCtx_) {
+    error(0, 0, "void function '" + node.name + "' used in expression");
+    return;
+  }
   if (node.args.size() != sym->paramTypes.size()) {
     error(0, 0, "function '" + node.name + "' expects " +
           std::to_string(sym->paramTypes.size()) + " arguments, got " +
@@ -270,7 +296,10 @@ void SemanticAnalyzer::visit(CallExpr& node) {
     return;
   }
   for (auto& arg : node.args) {
+    bool saved = inValueCtx_;
+    inValueCtx_ = true;
     arg->accept(*this);
+    inValueCtx_ = saved;
   }
 }
 
